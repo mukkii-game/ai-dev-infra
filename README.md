@@ -71,7 +71,9 @@ jobs:
 - `main` への push、PRのmerge、デプロイは行いません
 - checkout したアプリコードを高権限で実行しません
 
-Playwright の Chromium バイナリおよび必要なOS依存関係のダウンロードのみ許可しています。
+ネットワーク取得については、`npm ci` による lockfile に固定された依存関係の取得、および
+CI環境の構築に必要な Node.js・GitHub Actions・Playwright の Chromium / OS依存関係の取得は
+行います。一方で、不足したCLIを `npx` 等で暗黙に追加取得することはしません。
 
 ## このリポジトリで扱わないもの
 
