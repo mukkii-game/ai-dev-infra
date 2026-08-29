@@ -1,0 +1,98 @@
+name: Merge Guard
+
+# Reusable policy for enabling native auto-merge on ordinary pull requests.
+# The caller must be triggered by pull_request_target, grant only the two
+# permissions below, and must never check out pull-request code.
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  guard:
+    name: Guard and enable auto-merge
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - name: Check caller event
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" != 'pull_request_target' ]; then
+            echo "::error::Merge Guard must be called from pull_request_target, got ${EVENT_NAME}."
+            exit 1
+          fi
+          if ! [[ "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::The caller did not provide a valid pull request event."
+            exit 1
+          fi
+          case "${EVENT_ACTION}" in
+            opened|synchronize|reopened|ready_for_review) ;;
+            *)
+              echo "::error::Unexpected pull_request_target action: ${EVENT_ACTION}."
+              exit 1
+              ;;
+          esac
+
+      # No checkout: untrusted PR code never reaches this write-capable runner.
+      - name: Check changed files and enable auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          EXPECTED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+
+          if [ "${HEAD_REPO:-}" != "${REPO}" ]; then
+            echo "::error::Head repository is not ${REPO}; auto-merge is only enabled for branches in this repository."
+            exit 1
+          fi
+
+          if [ "${EXPECTED_FILES}" -gt 3000 ]; then
+            echo "::error::This pull request changes ${EXPECTED_FILES} files, more than the files API will list."
+            exit 1
+          fi
+
+          gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+            --jq '.[] | {filename: .filename, previous_filename: (.previous_filename // null)}' \
+            > files.jsonl
+
+          verdict=$(jq -s --argjson expected "${EXPECTED_FILES}" '
+            def touches_github:
+              . != null and (ascii_downcase | test("^\\.github(/|$)"));
+            {
+              seen: length,
+              expected: $expected,
+              offenders: [
+                .[] | select((.filename | touches_github)
+                          or (.previous_filename | touches_github))
+              ]
+            }
+          ' files.jsonl)
+
+          seen=$(jq -r '.seen' <<<"${verdict}")
+          offending=$(jq -r '.offenders | length' <<<"${verdict}")
+          echo "Files inspected: ${seen} (pull request reports ${EXPECTED_FILES})"
+
+          if [ "${seen}" -ne "${EXPECTED_FILES}" ]; then
+            echo "::error::Inspected ${seen} files but this pull request reports ${EXPECTED_FILES}; not every change could be verified."
+            exit 1
+          fi
+
+          if [ "${offending}" -ne 0 ]; then
+            echo "::error::This pull request touches .github/**; auto-merge will not be enabled."
+            echo 'Offending entries (JSON-encoded):'
+            jq -c '.offenders[]' <<<"${verdict}" | sed 's/::/;;/g'
+            exit 1
+          fi
+
+          echo 'No .github/** changes; enabling auto-merge.'
+          gh pr merge --auto --squash --repo "${REPO}" "${PR_NUMBER}"
