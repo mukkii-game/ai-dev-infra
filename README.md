@@ -53,7 +53,7 @@ permissions:
 
 jobs:
   verify:
-    uses: mukkii-game/ai-dev-infra/.github/workflows/verify-web.yml@main
+    uses: mukkii-game/ai-dev-infra/.github/workflows/verify-web.yml@v1
     # inputs は任意。省略時は artifact_path: dist / node_version: lts/* が使われます。
     with:
       artifact_path: dist
@@ -65,8 +65,8 @@ jobs:
 `verify-web.yml` は、信頼できないPRのコードを実行するものとして設計しています。
 
 - permissions は `contents: read` のみ
-- secrets は一切受け取りません（`workflow_call` で `secrets` を定義していないため、
-  呼び出し側から渡すこともできません）
+- secrets を一切参照・使用しません。workflow 内のどのステップも secret を読み取らず、
+  環境変数やコマンドライン経由でアプリコードに渡すこともありません
 - GitHub への write 権限を持ちません
 - `main` への push、PRのmerge、デプロイは行いません
 - checkout したアプリコードを高権限で実行しません
