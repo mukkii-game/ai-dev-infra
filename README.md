@@ -53,11 +53,76 @@ permissions:
 
 jobs:
   verify:
-    uses: mukkii-game/ai-dev-infra/.github/workflows/verify-web.yml@v1
+    uses: mukkii-game/ai-dev-infra/.github/workflows/verify-web.yml@v2
     # inputs は任意。省略時は artifact_path: dist / node_version: lts/* が使われます。
     with:
       artifact_path: dist
       node_version: lts/*
+```
+
+### `.github/workflows/merge-guard.yml`
+
+通常PRについて、変更された全パスをAPIから検査し、`.github/**` に触れず、fork
+でもない場合に限ってGitHub native auto-mergeを有効にします。rename前のパス、
+API件数、3000ファイル上限もfail-closedで検査します。
+
+呼び出し側は `pull_request_target` を宣言し、次の薄いcallerだけを保持します。
+
+```yaml
+name: Merge Guard
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: merge-guard-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    uses: mukkii-game/ai-dev-infra/.github/workflows/merge-guard.yml@v2
+```
+
+reusable化により必須チェックcontextは
+`guard / Guard and enable auto-merge` になります。既存リポジトリのrulesetもcaller
+移行と同時にこのcontextへ更新します。
+
+### `.github/workflows/deploy-pages.yml`
+
+CIが検証・保存した `web-build` artifactだけをGitHub Pagesへ公開します。再buildは
+しません。`workflow_run` のPR CIとmain push CIを扱い、bot merge・現在のmain・
+Git tree一致を検証します。
+
+bot merge待ちは最大5分です。時間内にmergeされない場合はwarningを残し、callerの
+`workflow_dispatch` から現在のmainに対応するCI artifactを再検証して公開できます。
+
+```yaml
+name: Deploy Pages
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    uses: mukkii-game/ai-dev-infra/.github/workflows/deploy-pages.yml@v2
 ```
 
 ## セキュリティ方針
@@ -68,14 +133,21 @@ jobs:
 - secrets を一切参照・使用しません。workflow 内のどのステップも secret を読み取らず、
   環境変数やコマンドライン経由でアプリコードに渡すこともありません
 - GitHub への write 権限を持ちません
-- `main` への push、PRのmerge、デプロイは行いません
-- checkout したアプリコードを高権限で実行しません
+- verify workflowは `main` へのpush、PRのmerge、デプロイを行いません
+- Merge GuardはPRコードをcheckout・実行せず、APIのパス情報だけを扱います
+- Deploy PagesはCI artifactを実行せず、検証後にPagesへ転送します
+- 各callerは必要なpermissionsを明示し、called workflowは権限を昇格できません
+- 外部Actionsはすべて完全なcommit SHAに固定します
 
 ネットワーク取得については、`npm ci` による lockfile に固定された依存関係の取得、および
 CI環境の構築に必要な Node.js・GitHub Actions・Playwright の Chromium / OS依存関係の取得は
 行います。一方で、不足したCLIを `npx` 等で暗黙に追加取得することはしません。
 
-## このリポジトリで扱わないもの
+## リリース参照
 
-auto-merge / デプロイ / `workflow_dispatch` / GitHub Pages / Cloudflare /
-bootstrap 処理 / PAT やその他の secret は、現時点では実装しません。
+`v1` は既存CIの不変参照として動かしません。reusable Guard・Pages、再公開経路、
+Node 24対応Actionsをまとめた次世代版は、固定commit SHAでcanaryを通した後にだけ
+`v2` として公開します。`v2` 作成前に利用側を切り替えません。
+
+このリポジトリはPATやアプリのsecretを保持しません。リポジトリ生成と管理資格情報は
+非公開の `mukkii-game/ai-ops` だけが扱います。
