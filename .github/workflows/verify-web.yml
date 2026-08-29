@@ -1,0 +1,142 @@
+name: Verify Web App
+
+# Reusable workflow for Vite + TypeScript + npm web applications.
+#
+# Security posture: this job is treated as running UNTRUSTED pull request code.
+#   - read-only `contents: read` permission, nothing else
+#   - no secret is referenced or used anywhere in this workflow, so nothing a
+#     caller inherits is ever read, passed to a step, or exposed to app code
+#   - the checked-out application code is only ever executed through local dev
+#     tooling; nothing here pushes, merges, deploys, or writes to GitHub
+on:
+  workflow_call:
+    inputs:
+      artifact_path:
+        description: Directory produced by the build and uploaded as an artifact.
+        type: string
+        required: false
+        default: dist
+      node_version:
+        description: Node.js version passed to actions/setup-node.
+        type: string
+        required: false
+        default: lts/*
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (typecheck, unit, build, e2e)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Do not leave the Actions token in .git/config for application code.
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Verify package-lock.json exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f package-lock.json ]; then
+            echo "::error file=package-lock.json::package-lock.json not found in the repository root."
+            echo ""
+            echo "This workflow requires a committed npm lockfile so that CI installs"
+            echo "exactly the dependency versions the repository declares."
+            echo "It deliberately does NOT fall back to 'npm install'."
+            echo ""
+            echo "Fix: run 'npm install' locally and commit the generated package-lock.json."
+            exit 1
+          fi
+          echo "Found package-lock.json."
+
+      - name: Install dependencies (npm ci)
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+
+      - name: Verify required local CLIs are installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for cli in tsc vitest vite playwright; do
+            if [ -x "./node_modules/.bin/${cli}" ]; then
+              echo "Found ./node_modules/.bin/${cli}"
+            else
+              missing+=("${cli}")
+            fi
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Missing local CLI(s) after 'npm ci': ${missing[*]}"
+            echo ""
+            echo "This workflow runs the CLIs from ./node_modules/.bin/ directly and never"
+            echo "fetches packages from the network via 'npx'."
+            echo ""
+            echo "Fix: add the missing tools to the repository's devDependencies"
+            echo "(typescript, vitest, vite, @playwright/test) and commit the updated"
+            echo "package.json and package-lock.json."
+            exit 1
+          fi
+
+      - name: Type check
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/tsc --noEmit
+
+      - name: Unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/vitest run
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/vite build
+
+      - name: Install Playwright Chromium and OS dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/playwright install --with-deps chromium
+
+      - name: End-to-end tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/playwright test
+
+      # Reached only when every step above succeeded; the job fails fast otherwise.
+      - name: Verify build output exists
+        shell: bash
+        env:
+          ARTIFACT_PATH: ${{ inputs.artifact_path }}
+        run: |
+          set -euo pipefail
+          if [ ! -e "$ARTIFACT_PATH" ]; then
+            echo "::error::Build output '$ARTIFACT_PATH' was not produced by 'vite build'."
+            echo "Set the 'artifact_path' input to the directory your Vite config emits."
+            exit 1
+          fi
+          echo "Build output '$ARTIFACT_PATH' is present."
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-build
+          path: ${{ inputs.artifact_path }}
+          if-no-files-found: error
