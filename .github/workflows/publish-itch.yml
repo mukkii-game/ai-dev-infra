@@ -1,0 +1,334 @@
+name: Publish to itch.io
+
+# Reusable itch.io publisher. It uploads the exact web-build artifact produced
+# by CI, never rebuilds or executes application code, and fails closed when the
+# caller event or repository state cannot be positively verified.
+#
+# The butler API key reaches exactly one step, and only after the artifact has
+# been authorized. Untrusted pull request code cannot reach this workflow: the
+# caller runs from the default branch on workflow_run, nothing is checked out,
+# and the gate below accepts only a bot-merged, tree-identical current main.
+on:
+  workflow_call:
+    inputs:
+      itch_target:
+        description: The itch.io project to push to, as user/game.
+        type: string
+        required: true
+      itch_channel:
+        description: The butler channel within that project.
+        type: string
+        required: false
+        default: html5
+      butler_version:
+        description: butler release to install from broth, or LATEST.
+        type: string
+        required: false
+        default: LATEST
+    secrets:
+      butler_api_key:
+        description: An itch.io API key with push rights on itch_target.
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  publish:
+    name: Push the CI artifact to itch.io
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       (github.event.workflow_run.event == 'pull_request' ||
+        github.event.workflow_run.event == 'push'))
+
+    steps:
+      - name: Authorize a CI artifact
+        id: authorize
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CALLER_EVENT: ${{ github.event_name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+
+          echo 'publish=false' >> "${GITHUB_OUTPUT}"
+          main_sha=$(gh api "repos/${REPO}/git/ref/heads/main" --jq '.object.sha')
+
+          authorize() {
+            local authorized_run_id="$1"
+            local authorized_main_sha="$2"
+            if ! [[ "${authorized_run_id}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::No valid CI run id was authorized."
+              exit 1
+            fi
+            if ! [[ "${authorized_main_sha}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::No valid main commit was authorized."
+              exit 1
+            fi
+            echo "run_id=${authorized_run_id}" >> "${GITHUB_OUTPUT}"
+            echo "main_sha=${authorized_main_sha}" >> "${GITHUB_OUTPUT}"
+            echo 'publish=true' >> "${GITHUB_OUTPUT}"
+          }
+
+          authorize_bot_pr() {
+            local pr_number="$1"
+            local tested_head_sha="$2"
+            local expected_merge_sha="$3"
+            local pr merged_by merge_sha head_tree merge_tree
+
+            pr=$(gh api "repos/${REPO}/pulls/${pr_number}")
+            jq -e \
+              --arg repo "${REPO}" \
+              --arg head_sha "${tested_head_sha}" \
+              --arg merge_sha "${expected_merge_sha}" '
+                .merged == true
+                and .base.ref == "main"
+                and .head.repo.full_name == $repo
+                and .head.sha == $head_sha
+                and .merge_commit_sha == $merge_sha
+              ' <<<"${pr}" >/dev/null || {
+                echo "::error::PR #${pr_number} does not match the tested head and current main."
+                exit 1
+              }
+
+            merged_by=$(jq -r '.merged_by.login // ""' <<<"${pr}")
+            merge_sha=$(jq -r '.merge_commit_sha // ""' <<<"${pr}")
+            if [ "${merged_by}" != 'github-actions[bot]' ]; then
+              echo "::error::PR #${pr_number} was not merged by github-actions[bot]."
+              exit 1
+            fi
+            if [ "${merge_sha}" != "${expected_merge_sha}" ]; then
+              echo "::error::PR #${pr_number} is not the current main commit."
+              exit 1
+            fi
+
+            head_tree=$(gh api "repos/${REPO}/git/commits/${tested_head_sha}" --jq '.tree.sha')
+            merge_tree=$(gh api "repos/${REPO}/git/commits/${merge_sha}" --jq '.tree.sha')
+            if [ "${head_tree}" != "${merge_tree}" ]; then
+              echo "::error::The tested PR tree differs from its merge commit."
+              exit 1
+            fi
+          }
+
+          if [ "${CALLER_EVENT}" = 'workflow_dispatch' ]; then
+            echo "Manually recovering the CI artifact for main ${main_sha}."
+
+            runs=$(gh api "repos/${REPO}/actions/runs?branch=main&status=success&per_page=100")
+            run_id=$(jq -r --arg main_sha "${main_sha}" '
+              [.workflow_runs[]
+               | select(.name == "CI"
+                        and .event == "push"
+                        and .head_branch == "main"
+                        and .head_sha == $main_sha
+                        and .conclusion == "success")]
+              | sort_by(.created_at)
+              | last.id // empty
+            ' <<<"${runs}")
+
+            if [ -n "${run_id}" ]; then
+              authorize "${run_id}" "${main_sha}"
+              exit 0
+            fi
+
+            pulls=$(gh api "repos/${REPO}/commits/${main_sha}/pulls")
+            candidate=$(jq -c --arg main_sha "${main_sha}" '
+              [.[]
+               | select(.merged_at != null
+                        and .base.ref == "main"
+                        and .merge_commit_sha == $main_sha)]
+            ' <<<"${pulls}")
+            count=$(jq -r 'length' <<<"${candidate}")
+            if [ "${count}" -ne 1 ]; then
+              echo "::error::Expected one merged PR for current main, found ${count}."
+              exit 1
+            fi
+
+            pr_number=$(jq -r '.[0].number' <<<"${candidate}")
+            run_sha=$(jq -r '.[0].head.sha' <<<"${candidate}")
+            authorize_bot_pr "${pr_number}" "${run_sha}" "${main_sha}"
+
+            runs=$(gh api "repos/${REPO}/actions/runs?head_sha=${run_sha}&event=pull_request&status=success&per_page=100")
+            # GitHub may clear workflow_runs[].pull_requests after merge. The
+            # commit-to-PR lookup and authorize_bot_pr above already prove the
+            # unique current-main PR, bot actor, head SHA and tree identity, so
+            # the run itself is selected by that exact tested head and event.
+            run_id=$(jq -r --arg run_sha "${run_sha}" '
+              [.workflow_runs[]
+               | select(.name == "CI"
+                        and .event == "pull_request"
+                        and .head_sha == $run_sha
+                        and .conclusion == "success")]
+              | sort_by(.created_at)
+              | last.id // empty
+            ' <<<"${runs}")
+            if [ -z "${run_id}" ]; then
+              echo "::error::No successful pull_request CI run exists for ${run_sha}."
+              exit 1
+            fi
+
+            authorize "${run_id}" "${main_sha}"
+            exit 0
+          fi
+
+          if [ "${CALLER_EVENT}" != 'workflow_run' ]; then
+            echo "::error::Deploy Pages must be called from workflow_run or workflow_dispatch, got ${CALLER_EVENT}."
+            exit 1
+          fi
+          if ! [[ "${RUN_ID}" =~ ^[1-9][0-9]*$ ]] || ! [[ "${RUN_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The workflow_run context did not reach the reusable workflow."
+            exit 1
+          fi
+          echo "Received workflow_run id ${RUN_ID}, event ${RUN_EVENT}, head ${RUN_SHA}."
+
+          if [ "${RUN_EVENT}" = 'push' ]; then
+            if [ "${RUN_BRANCH}" != 'main' ]; then
+              echo "::notice::Ignoring a successful push CI run for a branch other than main."
+              exit 0
+            fi
+            if [ "${RUN_SHA}" != "${main_sha}" ]; then
+              echo "::notice::main moved past push build ${RUN_SHA}; not publishing a stale artifact."
+              exit 0
+            fi
+            authorize "${RUN_ID}" "${main_sha}"
+            exit 0
+          fi
+
+          jq -e --arg run_sha "${RUN_SHA}" '
+            .workflow_run.pull_requests
+            | length == 1
+              and .[0].base.ref == "main"
+              and .[0].head.sha == $run_sha
+          ' "${GITHUB_EVENT_PATH}" >/dev/null || {
+            echo "::error::The triggering run does not identify exactly one main-based PR at ${RUN_SHA}."
+            exit 1
+          }
+          pr_number=$(jq -r '.workflow_run.pull_requests[0].number' "${GITHUB_EVENT_PATH}")
+
+          merged=false
+          for attempt in {1..60}; do
+            pr=$(gh api "repos/${REPO}/pulls/${pr_number}")
+            jq -e --arg repo "${REPO}" --arg run_sha "${RUN_SHA}" '
+              .base.ref == "main"
+              and .head.repo.full_name == $repo
+              and .head.sha == $run_sha
+            ' <<<"${pr}" >/dev/null || {
+              echo "::error::PR #${pr_number} no longer matches the triggering CI run."
+              exit 1
+            }
+
+            if [ "$(jq -r '.merged' <<<"${pr}")" = 'true' ]; then
+              merged=true
+              break
+            fi
+            if [ "${attempt}" -lt 60 ]; then sleep 5; fi
+          done
+
+          if [ "${merged}" != 'true' ]; then
+            echo "::warning::PR #${pr_number} did not merge within five minutes; run Deploy Pages manually after it merges."
+            exit 0
+          fi
+
+          merge_sha=$(jq -r '.merge_commit_sha // ""' <<<"${pr}")
+          main_sha=$(gh api "repos/${REPO}/git/ref/heads/main" --jq '.object.sha')
+          if [ "${main_sha}" != "${merge_sha}" ]; then
+            echo "::notice::main moved past merged PR #${pr_number}; not publishing a stale artifact."
+            exit 0
+          fi
+
+          authorize_bot_pr "${pr_number}" "${RUN_SHA}" "${merge_sha}"
+          authorize "${RUN_ID}" "${main_sha}"
+
+      - name: Check the target and channel are well formed
+        if: steps.authorize.outputs.publish == 'true'
+        env:
+          ITCH_TARGET: ${{ inputs.itch_target }}
+          ITCH_CHANNEL: ${{ inputs.itch_channel }}
+          BUTLER_VERSION: ${{ inputs.butler_version }}
+        run: |
+          set -euo pipefail
+          # These three reach a command line, so they are checked against an
+          # allow-list rather than trusted from the caller.
+          if ! [[ "${ITCH_TARGET}" =~ ^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*$ ]]; then
+            echo "::error::itch_target must be user/game in itch.io slug form, got '${ITCH_TARGET}'."
+            exit 1
+          fi
+          if ! [[ "${ITCH_CHANNEL}" =~ ^[a-z0-9][a-z0-9_.-]*$ ]]; then
+            echo "::error::itch_channel must be an itch.io channel name, got '${ITCH_CHANNEL}'."
+            exit 1
+          fi
+          if ! [[ "${BUTLER_VERSION}" =~ ^(LATEST|[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::butler_version must be LATEST or a x.y.z release, got '${BUTLER_VERSION}'."
+            exit 1
+          fi
+
+      - name: Download the artifact CI verified
+        if: steps.authorize.outputs.publish == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-build
+          path: site
+          run-id: ${{ steps.authorize.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Check the artifact holds a site
+        if: steps.authorize.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          test -f site/index.html
+
+      - name: Install butler
+        if: steps.authorize.outputs.publish == 'true'
+        env:
+          BUTLER_VERSION: ${{ inputs.butler_version }}
+        run: |
+          set -euo pipefail
+          # butler is fetched from itch.io's own distribution server. It is not
+          # pinned by checksum: broth serves the archive and any checksum it
+          # would be compared against, so a hash from the same origin proves
+          # transfer integrity only. Pin butler_version to hold a release fixed.
+          curl --fail --silent --show-error --location --retry 3 \
+            -o butler.zip \
+            "https://broth.itch.zone/butler/linux-amd64/${BUTLER_VERSION}/archive/default"
+          unzip -q -o butler.zip -d butler-bin
+          chmod +x butler-bin/butler
+          ./butler-bin/butler -V
+
+      - name: Confirm main is still current
+        id: freshness
+        if: steps.authorize.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EXPECTED_MAIN_SHA: ${{ steps.authorize.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          main_sha=$(gh api "repos/${REPO}/git/ref/heads/main" --jq '.object.sha')
+          if [ "${main_sha}" = "${EXPECTED_MAIN_SHA}" ]; then
+            echo 'current=true' >> "${GITHUB_OUTPUT}"
+          else
+            echo 'current=false' >> "${GITHUB_OUTPUT}"
+            echo "::notice::main moved during packaging; not publishing a stale artifact."
+          fi
+
+      # The only step that sees the key, and only once everything above passed.
+      - name: Push the site to itch.io
+        if: steps.freshness.outputs.current == 'true'
+        env:
+          BUTLER_API_KEY: ${{ secrets.butler_api_key }}
+          ITCH_TARGET: ${{ inputs.itch_target }}
+          ITCH_CHANNEL: ${{ inputs.itch_channel }}
+          MAIN_SHA: ${{ steps.authorize.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          ./butler-bin/butler push site \
+            "${ITCH_TARGET}:${ITCH_CHANNEL}" \
+            --userversion "${MAIN_SHA:0:12}"
+          echo "Pushed main ${MAIN_SHA} to ${ITCH_TARGET}:${ITCH_CHANNEL}."
