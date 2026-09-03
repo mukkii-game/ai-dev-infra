@@ -125,6 +125,73 @@ jobs:
     uses: mukkii-game/ai-dev-infra/.github/workflows/deploy-pages.yml@v2
 ```
 
+### `.github/workflows/publish-itch.yml`
+
+CIが検証・保存した `web-build` artifactだけを、butler で itch.io へ公開します。
+`deploy-pages.yml` とまったく同じ認可ゲート（bot merge・現在のmain・Git tree一致）を
+通してから公開し、再buildもコードの実行もしません。
+
+Vite の `base` が `./` であれば、Pages に出しているものと**同一のartifact**が
+itch.io でもそのまま動きます。itch用の別ビルドは不要です。
+
+APIキーは最後の push ステップにしか渡りません。checkout もしないため、PRのコードが
+キーに到達する経路がありません。認可ゲートの本文は `deploy-pages.yml` と
+byte単位で一致していることをCIが検査します（片方だけ緩むのを防ぐため）。
+
+#### inputs / secrets
+
+| name | 種別 | required | default | 説明 |
+| --- | --- | --- | --- | --- |
+| `itch_target` | input | yes | — | 公開先。`user/game` 形式 |
+| `itch_channel` | input | no | `html5` | butler のチャンネル名 |
+| `butler_version` | input | no | `LATEST` | butler のバージョン。`x.y.z` で固定可 |
+| `butler_api_key` | secret | yes | — | itch.io の API キー |
+
+`itch_target` / `itch_channel` / `butler_version` はコマンドラインに渡るため、
+許可パターンに一致しない値はゲート通過後でも実行前に失敗させます。
+
+#### 呼び出し側の例
+
+secret はcaller側リポジトリに置きます。このリポジトリはsecretを保持しません。
+また、callerは渡すsecretを**明示**します。`secrets: inherit` は使いません。
+
+```yaml
+name: Publish to itch.io
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: itch
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    uses: mukkii-game/ai-dev-infra/.github/workflows/publish-itch.yml@v3
+    with:
+      itch_target: your-itch-user/your-game
+    secrets:
+      butler_api_key: ${{ secrets.BUTLER_API_KEY }}
+```
+
+#### 初回だけ必要な手動作業
+
+1. itch.io でプロジェクトを作成する（butlerは存在しないプロジェクトを作れません）
+2. https://itch.io/user/settings/api-keys でAPIキーを発行する
+3. caller側リポジトリの Settings → Secrets and variables → Actions に
+   `BUTLER_API_KEY` として登録する
+4. 初回 push 後、itch.io のプロジェクト編集画面で Kind of project が
+   *HTML* になっていること、アップロードが
+   *This file will be played in the browser* になっていることを確認する
+   （`html` を含むチャンネル名なら通常は自動で設定されます）
+
 ## セキュリティ方針
 
 `verify-web.yml` は、信頼できないPRのコードを実行するものとして設計しています。
@@ -136,6 +203,8 @@ jobs:
 - verify workflowは `main` へのpush、PRのmerge、デプロイを行いません
 - Merge GuardはPRコードをcheckout・実行せず、APIのパス情報だけを扱います
 - Deploy PagesはCI artifactを実行せず、検証後にPagesへ転送します
+- Publish to itch.ioも同じ認可ゲートを通し、artifactを実行しません。APIキーは
+  ゲート通過後のpushステップ1箇所にしか渡らず、callerは渡すsecretを明示します
 - 各callerは必要なpermissionsを明示し、called workflowは権限を昇格できません
 - 外部Actionsはすべて完全なcommit SHAに固定します
 
@@ -148,6 +217,10 @@ CI環境の構築に必要な Node.js・GitHub Actions・Playwright の Chromium
 `v1` は既存CIの不変参照として動かしません。reusable Guard・Pages、再公開経路、
 Node 24対応Actionsをまとめた次世代版は、固定commit SHAでcanaryを通した後にだけ
 `v2` として公開します。`v2` 作成前に利用側を切り替えません。
+
+`publish-itch.yml` を含む `v3` も同じ手順で公開します。callerはまず固定commit SHAを
+参照してcanaryを通し、実際にitch.ioへ公開できたことを確認してから `v3` を作成し、
+その後にcallerを `@v3` へ切り替えます。
 
 このリポジトリはPATやアプリのsecretを保持しません。リポジトリ生成と管理資格情報は
 非公開の `mukkii-game/ai-ops` だけが扱います。
