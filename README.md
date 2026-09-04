@@ -53,7 +53,7 @@ permissions:
 
 jobs:
   verify:
-    uses: mukkii-game/ai-dev-infra/.github/workflows/verify-web.yml@v2
+    uses: mukkii-game/ai-dev-infra/.github/workflows/verify-web.yml@main
     # inputs は任意。省略時は artifact_path: dist / node_version: lts/* が使われます。
     with:
       artifact_path: dist
@@ -62,9 +62,10 @@ jobs:
 
 ### `.github/workflows/merge-guard.yml`
 
-通常PRについて、変更された全パスをAPIから検査し、`.github/**` に触れず、fork
-でもない場合に限ってGitHub native auto-mergeを有効にします。rename前のパス、
-API件数、3000ファイル上限もfail-closedで検査します。
+このリポジトリ内のブランチからのPRについて、fork でない場合に GitHub native
+auto-merge を有効にします。`.github/**` の変更も同じく自動マージされます。
+「ワークフロー変更は人間の承認必須」という安全弁は、1人＋AIの運用では守るもの
+より手動マージの手間のほうが大きかったため外しました。
 
 呼び出し側は `pull_request_target` を宣言し、次の薄いcallerだけを保持します。
 
@@ -85,7 +86,7 @@ concurrency:
 
 jobs:
   guard:
-    uses: mukkii-game/ai-dev-infra/.github/workflows/merge-guard.yml@v2
+    uses: mukkii-game/ai-dev-infra/.github/workflows/merge-guard.yml@main
 ```
 
 reusable化により必須チェックcontextは
@@ -122,7 +123,7 @@ concurrency:
 
 jobs:
   deploy:
-    uses: mukkii-game/ai-dev-infra/.github/workflows/deploy-pages.yml@v2
+    uses: mukkii-game/ai-dev-infra/.github/workflows/deploy-pages.yml@main
 ```
 
 ### `.github/workflows/publish-itch.yml`
@@ -174,7 +175,7 @@ concurrency:
 
 jobs:
   publish:
-    uses: mukkii-game/ai-dev-infra/.github/workflows/publish-itch.yml@v3
+    uses: mukkii-game/ai-dev-infra/.github/workflows/publish-itch.yml@main
     with:
       itch_target: your-itch-user/your-game
     secrets:
@@ -201,7 +202,7 @@ jobs:
   環境変数やコマンドライン経由でアプリコードに渡すこともありません
 - GitHub への write 権限を持ちません
 - verify workflowは `main` へのpush、PRのmerge、デプロイを行いません
-- Merge GuardはPRコードをcheckout・実行せず、APIのパス情報だけを扱います
+- Merge GuardはPRコードをcheckout・実行しません
 - Deploy PagesはCI artifactを実行せず、検証後にPagesへ転送します
 - Publish to itch.ioも同じ認可ゲートを通し、artifactを実行しません。APIキーは
   ゲート通過後のpushステップ1箇所にしか渡らず、callerは渡すsecretを明示します
@@ -212,15 +213,14 @@ jobs:
 CI環境の構築に必要な Node.js・GitHub Actions・Playwright の Chromium / OS依存関係の取得は
 行います。一方で、不足したCLIを `npx` 等で暗黙に追加取得することはしません。
 
-## リリース参照
+## 参照のしかた
 
-`v1` は既存CIの不変参照として動かしません。reusable Guard・Pages、再公開経路、
-Node 24対応Actionsをまとめた次世代版は、固定commit SHAでcanaryを通した後にだけ
-`v2` として公開します。`v2` 作成前に利用側を切り替えません。
+caller は `@main` を参照します。不変タグ（`v1` `v2`）と「固定SHAでcanaryを通してから
+タグを切る」手順は廃止しました。ワークフロー1本を足すのに手動マージが3回必要になり、
+1人＋AIの運用では安全弁より手間のほうが大きかったためです。
 
-`publish-itch.yml` を含む `v3` も同じ手順で公開します。callerはまず固定commit SHAを
-参照してcanaryを通し、実際にitch.ioへ公開できたことを確認してから `v3` を作成し、
-その後にcallerを `@v3` へ切り替えます。
+`main` へのpushは即すべてのcallerに効きます。壊れたらこのリポジトリで直して
+pushすれば、次のCIから直ります。`v1` `v2` タグは履歴として残しますが更新しません。
 
 このリポジトリはPATやアプリのsecretを保持しません。リポジトリ生成と管理資格情報は
 非公開の `mukkii-game/ai-ops` だけが扱います。

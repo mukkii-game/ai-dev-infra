@@ -43,3 +43,13 @@ it, so verifying one against the other proves transfer integrity and nothing
 more. The workflow says so in place rather than implying a supply-chain
 guarantee it does not have. `butler_version` pins a release when reproducibility
 matters.
+
+## 2026-09-04 — Safety valves that cost merges are removed
+
+Two earlier decisions are reversed. Callers now reference `@main`; immutable
+release tags and the canary-before-tag step are gone. Merge Guard no longer
+refuses `.github/**` changes; every in-repository pull request auto-merges once
+CI passes. Both valves were built for a team; this is one person and their
+agents, and adding one workflow cost three manual merges. What stays: the fork
+refusal, no checkout on write-capable runners, secrets named rather than
+inherited, and the two publishers sharing one gate verbatim.
