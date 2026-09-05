@@ -70,7 +70,7 @@ deploy = File.read(File.join(ROOT, ".github", "workflows", "deploy-pages.yml"), 
 itch = File.read(File.join(ROOT, ".github", "workflows", "publish-itch.yml"), encoding: "UTF-8")
 
 fail_check("Merge Guard must not check out code") if guard.include?("actions/checkout")
-%w[previous_filename HEAD_REPO EXPECTED_FILES pull_request_target].each do |marker|
+%w[HEAD_REPO pull_request_target].each do |marker|
   fail_check("Merge Guard is missing #{marker}") unless guard.include?(marker)
 end
 

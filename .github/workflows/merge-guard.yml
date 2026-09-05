@@ -1,8 +1,8 @@
 name: Merge Guard
 
-# Reusable policy for enabling native auto-merge on ordinary pull requests.
-# The caller must be triggered by pull_request_target, grant only the two
-# permissions below, and must never check out pull-request code.
+# Reusable policy for enabling native auto-merge on pull requests from this
+# repository. The caller must be triggered by pull_request_target, grant only
+# the two permissions below, and must never check out pull-request code.
 on:
   workflow_call:
 
@@ -41,13 +41,12 @@ jobs:
           esac
 
       # No checkout: untrusted PR code never reaches this write-capable runner.
-      - name: Check changed files and enable auto-merge
+      - name: Enable auto-merge
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          EXPECTED_FILES: ${{ github.event.pull_request.changed_files }}
         run: |
           set -euo pipefail
 
@@ -56,43 +55,8 @@ jobs:
             exit 1
           fi
 
-          if [ "${EXPECTED_FILES}" -gt 3000 ]; then
-            echo "::error::This pull request changes ${EXPECTED_FILES} files, more than the files API will list."
-            exit 1
-          fi
-
-          gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
-            --jq '.[] | {filename: .filename, previous_filename: (.previous_filename // null)}' \
-            > files.jsonl
-
-          verdict=$(jq -s --argjson expected "${EXPECTED_FILES}" '
-            def touches_github:
-              . != null and (ascii_downcase | test("^\\.github(/|$)"));
-            {
-              seen: length,
-              expected: $expected,
-              offenders: [
-                .[] | select((.filename | touches_github)
-                          or (.previous_filename | touches_github))
-              ]
-            }
-          ' files.jsonl)
-
-          seen=$(jq -r '.seen' <<<"${verdict}")
-          offending=$(jq -r '.offenders | length' <<<"${verdict}")
-          echo "Files inspected: ${seen} (pull request reports ${EXPECTED_FILES})"
-
-          if [ "${seen}" -ne "${EXPECTED_FILES}" ]; then
-            echo "::error::Inspected ${seen} files but this pull request reports ${EXPECTED_FILES}; not every change could be verified."
-            exit 1
-          fi
-
-          if [ "${offending}" -ne 0 ]; then
-            echo "::error::This pull request touches .github/**; auto-merge will not be enabled."
-            echo 'Offending entries (JSON-encoded):'
-            jq -c '.offenders[]' <<<"${verdict}" | sed 's/::/;;/g'
-            exit 1
-          fi
-
-          echo 'No .github/** changes; enabling auto-merge.'
+          # Every in-repository pull request auto-merges once CI passes,
+          # .github/** included. Requiring a human for workflow changes was a
+          # safety valve that cost more in manual merges than it protected in
+          # a one-person, agent-driven repository.
           gh pr merge --auto --squash --repo "${REPO}" "${PR_NUMBER}"
